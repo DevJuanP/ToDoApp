@@ -1,0 +1,170 @@
+name: Preview iOS
+
+# Genera capturas reales de la app (claro y oscuro) usando un Mac de GitHub.
+#
+# Por qué existe: el proyecto es SwiftUI y no se puede renderizar en Windows.
+# Este workflow compila el proyecto con Xcode de verdad, lo ejecuta en el
+# simulador de iOS y sube las capturas como artifact. Es la "foto oficial"
+# del estado de la interfaz en cada push.
+#
+# CÓMO SE USA
+#   1. Push a main (o ejecutarlo a mano desde la pestaña Actions).
+#   2. Al terminar, baja el artifact "preview-capturas".
+#   3. Dentro están: login-claro.png, login-oscuro.png y ToDoApp.app.zip
+#      (este último sirve para arrastrarlo a https://appetize.io y tener el
+#      simulador interactivo en el navegador).
+#
+# NOTA SOBRE EL RUNNER
+#   El proyecto declara IPHONEOS_DEPLOYMENT_TARGET = 26.2, así que hace falta
+#   un Xcode 26.2 o superior. Los runners macos-14 / macos-15 ya fueron
+#   retirados (2 de noviembre de 2026). macos-26 trae Xcode 26.2–26.6.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Una ejecución por rama: si haces push dos veces seguidas, la anterior se
+# cancela en vez de encolarse. Ahorra minutos y evita capturas obsoletas.
+concurrency:
+  group: preview-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  capturas:
+    runs-on: macos-26
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Elegir Xcode
+        run: |
+          # Se queda con la versión más alta instalada (26.6 hoy) y lo deja
+          # como Xcode activo para el resto del job.
+          # No se usa `sort -V`: el `sort` de macOS (BSD) no soporta esa opción.
+          # `sort -t. -k1,1n -k2,2n -k3,3n` ordena numéricamente por cada tramo
+          # de la versión, que es lo que hace falta aquí.
+          XCODE_APP=$(ls /Applications \
+            | grep -E '^Xcode_[0-9.]+\.app$' \
+            | sed 's/Xcode_\([0-9.]*\)\.app/\1 &/' \
+            | sort -t. -k1,1n -k2,2n -k3,3n \
+            | tail -1 | cut -d' ' -f2)
+
+          if [ -z "$XCODE_APP" ]; then
+            # Salvaguarda: si el runner no expone carpetas versionadas y solo
+            # tiene el Xcode por defecto, se usa ese. Sin esto, xcode-select
+            # recibiría una ruta vacía y el job moriría sin explicación.
+            echo "No hay Xcode versionados; se usa el de por defecto."
+            xcodebuild -version
+          else
+            echo "Xcode elegido: $XCODE_APP"
+            sudo xcode-select -s "/Applications/$XCODE_APP"
+            xcodebuild -version
+          fi
+
+      - name: Elegir simulador
+        id: sim
+        run: |
+          # No se hardcodea "iPhone 17 Pro": si Apple renombra el catálogo,
+          # el workflow seguiría funcionando. Toma el primer iPhone disponible
+          # del runtime de iOS más reciente.
+          UDID=$(xcrun simctl list devices available --json \
+            | python3 -c '
+          import json, sys, re
+          data = json.load(sys.stdin)["devices"]
+          def version(rt):
+              m = re.search(r"iOS-([0-9-]+)$", rt)
+              return [int(p) for p in m.group(1).split("-")] if m else [0]
+          runtimes = sorted(data.keys(), key=version, reverse=True)
+          for rt in runtimes:
+              if "iOS" not in rt:
+                  continue
+              for d in data[rt]:
+                  if "iPhone" in d["name"]:
+                      print(d["udid"])
+                      sys.exit(0)
+          sys.exit("No hay ningún simulador de iPhone disponible")
+          ')
+          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+          echo "Simulador elegido: $UDID"
+
+      - name: Compilar para el simulador
+        run: |
+          xcodebuild \
+            -project ToDoApp.xcodeproj \
+            -scheme ToDoApp \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination "id=${{ steps.sim.outputs.udid }}" \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+        # CODE_SIGNING_ALLOWED=NO evita tener que configurar certificados:
+        # el simulador no exige firma. Es la razón de que esto funcione en un
+        # repo sin credenciales de Apple.
+
+      - name: Arrancar el simulador
+        run: |
+          UDID="${{ steps.sim.outputs.udid }}"
+          xcrun simctl boot "$UDID" || true
+          xcrun simctl bootstatus "$UDID" -b
+          # Barra de estado limpia: hora fija 9:41 y batería llena, como en las
+          # capturas oficiales de Apple. Si falla, no es crítico.
+          xcrun simctl status_bar "$UDID" override \
+            --time "9:41" --batteryState charged --batteryLevel 100 \
+            --dataNetwork wifi --wifiMode active --wifiBars 3 --cellularBars 4 \
+            || true
+
+      - name: Instalar y lanzar la app
+        run: |
+          UDID="${{ steps.sim.outputs.udid }}"
+          APP="build/Build/Products/Debug-iphonesimulator/ToDoApp.app"
+          test -d "$APP" || { echo "No se encontró el .app compilado"; exit 1; }
+          xcrun simctl install "$UDID" "$APP"
+          xcrun simctl launch "$UDID" pe.cibertec.juan.ToDoApp
+
+      - name: Capturar apariencia clara
+        run: |
+          UDID="${{ steps.sim.outputs.udid }}"
+          xcrun simctl ui "$UDID" appearance light
+          # Se espera a que termine la animación de entrada del LoginView
+          # (0.6 s) más el margen del primer frame.
+          sleep 3
+          xcrun simctl io "$UDID" screenshot --type=png login-claro.png
+
+      - name: Capturar apariencia oscura
+        run: |
+          UDID="${{ steps.sim.outputs.udid }}"
+          # Como Theme usa Color(uiColor: UIColor(dynamicProvider:)), el cambio
+          # de apariencia se aplica en vivo, sin relanzar la app.
+          xcrun simctl ui "$UDID" appearance dark
+          sleep 3
+          xcrun simctl io "$UDID" screenshot --type=png login-oscuro.png
+
+      - name: Empaquetar la app para Appetize
+        run: |
+          # Appetize.io espera un .zip que contenga el .app. Con esto puedes
+          # subirlo y tener el simulador interactivo en el navegador.
+          cd build/Build/Products/Debug-iphonesimulator
+          zip -qry "$GITHUB_WORKSPACE/ToDoApp.app.zip" ToDoApp.app
+          ls -lh "$GITHUB_WORKSPACE/ToDoApp.app.zip"
+
+      - name: Publicar capturas
+        uses: actions/upload-artifact@v4
+        with:
+          name: preview-capturas
+          path: |
+            login-claro.png
+            login-oscuro.png
+            ToDoApp.app.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Log del simulador si algo falló
+        if: failure()
+        run: |
+          xcrun simctl spawn "${{ steps.sim.outputs.udid }}" log show \
+            --last 5m --style compact | tail -100 || true
